@@ -1,6 +1,13 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'onboarding_screen.dart';
+import 'maintenance_screen.dart';
+import 'update_screen.dart';
+import 'dashboard_screen.dart';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
@@ -13,44 +20,168 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
   late AnimationController _controller;
   late Animation<double> _scaleAnimation;
   late Animation<double> _opacityAnimation;
+  late Animation<Offset> _slideAnimation;
+
+  bool _hasError = false;
+  String _errorMessage = '';
+  String _installedVersion = '1.0.0';
 
   @override
   void initState() {
     super.initState();
     _controller = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 1800),
+      duration: const Duration(milliseconds: 2000),
     );
 
-    _scaleAnimation = Tween<double>(begin: 0.8, end: 1.15).animate(
+    // Scale animation with elastic effect
+    _scaleAnimation = Tween<double>(begin: 0.5, end: 1.0).animate(
       CurvedAnimation(
         parent: _controller,
         curve: const Interval(0.0, 0.6, curve: Curves.elasticOut),
       ),
     );
 
+    // Opacity animation
     _opacityAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
       CurvedAnimation(
         parent: _controller,
-        curve: const Interval(0.0, 0.4, curve: Curves.easeIn),
+        curve: const Interval(0.0, 0.5, curve: Curves.easeOut),
+      ),
+    );
+
+    // Slide animation for subtitle
+    _slideAnimation = Tween<Offset>(
+      begin: const Offset(0, 0.5),
+      end: Offset.zero,
+    ).animate(
+      CurvedAnimation(
+        parent: _controller,
+        curve: const Interval(0.3, 0.7, curve: Curves.easeOut),
       ),
     );
 
     _controller.forward();
 
-    // Loop the pulse effect after the entry animation completes
-    _controller.addStatusListener((status) {
-      if (status == AnimationStatus.completed) {
-        _controller.repeat(reverse: true);
-      }
-    });
+    _initializeAppAndCheckStatus();
+  }
 
-    // Navigate to onboarding screen after 3 seconds
-    Timer(const Duration(milliseconds: 3000), () {
+  Future<void> _initializeAppAndCheckStatus() async {
+    final startTime = DateTime.now();
+
+    try {
       if (mounted) {
+        setState(() {
+          _hasError = false;
+          _errorMessage = '';
+        });
+      }
+
+      // 1. Get package info
+      final packageInfo = await PackageInfo.fromPlatform();
+      final currentVersion = packageInfo.version;
+      
+      if (mounted) {
+        setState(() {
+          _installedVersion = currentVersion;
+        });
+      }
+
+      // 2. Fetch app status from API
+      final response = await http.get(
+        Uri.parse('https://agsdemo.in/singlemartapi/public/api/app-check-status'),
+      ).timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        final data = json.decode(response.body);
+        final String success = data['success']?.toString() ?? 'false';
+
+        // Wait to complete at least 2.5 seconds of splash screen animations
+        final elapsed = DateTime.now().difference(startTime);
+        final remainingTime = const Duration(milliseconds: 2500) - elapsed;
+        if (remainingTime > Duration.zero) {
+          await Future.delayed(remainingTime);
+        }
+
+        if (!mounted) return;
+
+        // Check for Maintenance
+        if (success != 'true') {
+          // Extract company logo URL
+          String? logoUrl;
+          final companyDetails = data['company_detils'];
+          final imageUrlList = data['image_url'] as List?;
+          if (companyDetails != null && imageUrlList != null) {
+            final logoName = companyDetails['company_logo'];
+            final companyImgObj = imageUrlList.firstWhere(
+              (img) => img['image_for'] == 'Company',
+              orElse: () => null,
+            );
+            if (companyImgObj != null && logoName != null) {
+              logoUrl = '${companyImgObj['image_url']}$logoName';
+            }
+          }
+
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(
+              builder: (context) => MaintenanceScreen(
+                companyDetails: companyDetails,
+                logoUrl: logoUrl,
+              ),
+            ),
+          );
+          return;
+        }
+
+        // Check for Version Update
+        final versionObj = data['version'];
+        final String panelVersion = versionObj?['version_panel']?.toString() ?? '1.0.0';
+
+        if (currentVersion != panelVersion) {
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(
+              builder: (context) => UpdateScreen(
+                installedVersion: currentVersion,
+                latestVersion: panelVersion,
+              ),
+            ),
+          );
+          return;
+        }
+
+        // Version matches and app is not in maintenance, proceed to next screen (auto-login check)
+        _navigateToNextScreen();
+      } else {
+        throw Exception('Server returned status code ${response.statusCode}');
+      }
+    } catch (e) {
+      debugPrint('Error checking app status: $e');
+      if (mounted) {
+        setState(() {
+          _hasError = true;
+          _errorMessage = 'Unable to connect. Please check your internet connection.';
+        });
+      }
+    }
+  }
+
+  Future<void> _navigateToNextScreen() async {
+    if (!mounted) return;
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final String? token = prefs.getString('auth_token');
+      final String? userDataStr = prefs.getString('user_data');
+
+      if (token != null && token.isNotEmpty && userDataStr != null && userDataStr.isNotEmpty) {
+        final Map<String, dynamic> userData = json.decode(userDataStr);
+        if (!mounted) return;
         Navigator.of(context).pushReplacement(
           PageRouteBuilder(
-            pageBuilder: (context, animation, secondaryAnimation) => const OnboardingScreen(),
+            pageBuilder: (context, animation, secondaryAnimation) => DashboardScreen(
+              userData: userData,
+              token: token,
+            ),
             transitionsBuilder: (context, animation, secondaryAnimation, child) {
               return FadeTransition(
                 opacity: animation,
@@ -60,8 +191,26 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
             transitionDuration: const Duration(milliseconds: 800),
           ),
         );
+        return;
       }
-    });
+    } catch (e) {
+      debugPrint('Error loading auto-login session: $e');
+    }
+
+    // Default to onboarding screen
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(
+      PageRouteBuilder(
+        pageBuilder: (context, animation, secondaryAnimation) => const OnboardingScreen(),
+        transitionsBuilder: (context, animation, secondaryAnimation, child) {
+          return FadeTransition(
+            opacity: animation,
+            child: child,
+          );
+        },
+        transitionDuration: const Duration(milliseconds: 800),
+      ),
+    );
   }
 
   @override
@@ -73,62 +222,27 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFFFFFFF),
+      backgroundColor: Colors.white,
       body: Container(
         decoration: const BoxDecoration(
           gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
             colors: [
-              Color(0xFFFFFFFF), // Soft white
-              Color(0xFFF8FAFC), // Off-white/slate
-              Color(0xFFF1F5F9), // Light grey
+              Color(0xFFFFFFFF), // Pure white
+              Color(0xFFF8FAFC), // Off-white
+              Color(0xFFF1F5F9), // Light gray
             ],
-            stops: [0.0, 0.6, 1.0],
+            stops: [0.0, 0.5, 1.0],
           ),
         ),
         child: SafeArea(
           child: Stack(
             children: [
-              // Subtle background ambient glows (soft pastel colors for white theme)
-              Positioned(
-                top: -100,
-                right: -100,
-                child: Container(
-                  width: 300,
-                  height: 300,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    boxShadow: [
-                      BoxShadow(
-                        color: const Color(0xFF6C63FF).withOpacity(0.08),
-                        blurRadius: 100,
-                        spreadRadius: 50,
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              Positioned(
-                bottom: -50,
-                left: -50,
-                child: Container(
-                  width: 250,
-                  height: 250,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    boxShadow: [
-                      BoxShadow(
-                        color: const Color(0xFF00F2FE).withOpacity(0.06),
-                        blurRadius: 80,
-                        spreadRadius: 40,
-                      ),
-                    ],
-                  ),
-                ),
-              ),
+              // Decorative background circles
+              ..._buildBackgroundDecorations(),
               
-              // Core content
+              // Main content
               Center(
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
@@ -146,84 +260,167 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
                         );
                       },
                       child: Container(
-                        width: 140,
-                        height: 140,
+                        width: 150,
+                        height: 150,
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
+                          gradient: const LinearGradient(
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                            colors: [
+                              Color(0xFF6C63FF),
+                              Color(0xFF8B83FF),
+                              Color(0xFFA59FFF),
+                            ],
+                          ),
                           boxShadow: [
                             BoxShadow(
-                              color: const Color(0xFF6C63FF).withOpacity(0.18),
-                              blurRadius: 30,
-                              spreadRadius: 5,
+                              color: const Color(0xFF6C63FF).withOpacity(0.2),
+                              blurRadius: 40,
+                              spreadRadius: 10,
+                              offset: const Offset(0, 10),
                             ),
                           ],
                         ),
-                        child: CustomPaint(
-                          painter: LogoPainter(),
+                        child: const Center(
+                          child: Icon(
+                            Icons.shopping_bag_outlined,
+                            color: Colors.white,
+                            size: 70,
+                          ),
                         ),
                       ),
                     ),
                     const SizedBox(height: 40),
-                    // App Name
-                    const Text(
-                      'SingleMart',
-                      style: TextStyle(
-                        fontSize: 40,
-                        fontWeight: FontWeight.bold,
-                        color: Color(0xFF1E1B4B), // Deep indigo/charcoal
-                        letterSpacing: 2.0,
-                        shadows: [
-                          Shadow(
-                            color: Color(0x1F6C63FF),
-                            offset: Offset(0, 4),
-                            blurRadius: 15,
+                    
+                    // App Name with shimmer effect
+                    AnimatedBuilder(
+                      animation: _controller,
+                      builder: (context, child) {
+                        return Opacity(
+                          opacity: _opacityAnimation.value,
+                          child: ShaderMask(
+                            shaderCallback: (Rect bounds) {
+                              return const LinearGradient(
+                                colors: [
+                                  Color(0xFF1E1B4B),
+                                  Color(0xFF4F46E5),
+                                  Color(0xFF1E1B4B),
+                                ],
+                                stops: [0.0, 0.5, 1.0],
+                              ).createShader(bounds);
+                            },
+                            child: const Text(
+                              'SingleMart',
+                              style: TextStyle(
+                                fontSize: 44,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.white,
+                                letterSpacing: 2.0,
+                              ),
+                            ),
                           ),
-                        ],
-                      ),
+                        );
+                      },
                     ),
-                    const SizedBox(height: 10),
-                    // Subtitle
-                    const Text(
-                      'Your Unified Local Marketplace',
-                      style: TextStyle(
-                        fontSize: 14,
-                        color: Color(0xFF64748B), // Slate grey
-                        letterSpacing: 1.2,
-                        fontWeight: FontWeight.w500,
-                      ),
+                    const SizedBox(height: 12),
+                    
+                    // Subtitle with slide animation
+                    AnimatedBuilder(
+                      animation: _controller,
+                      builder: (context, child) {
+                        return SlideTransition(
+                          position: _slideAnimation,
+                          child: Opacity(
+                            opacity: _opacityAnimation.value,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF6C63FF).withOpacity(0.08),
+                                borderRadius: BorderRadius.circular(20),
+                              ),
+                              child: const Text(
+                                'Your Unified Local Marketplace',
+                                style: TextStyle(
+                                  fontSize: 15,
+                                  color: Color(0xFF64748B),
+                                  letterSpacing: 1.5,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                    const SizedBox(height: 60),
+                    
+                    // Loading indicator with dots or Error state
+                    AnimatedBuilder(
+                      animation: _controller,
+                      builder: (context, child) {
+                        return Opacity(
+                          opacity: _opacityAnimation.value,
+                          child: _hasError
+                              ? Column(
+                                  children: [
+                                    Padding(
+                                      padding: const EdgeInsets.symmetric(horizontal: 40.0),
+                                      child: Text(
+                                        _errorMessage,
+                                        textAlign: TextAlign.center,
+                                        style: const TextStyle(
+                                          color: Colors.redAccent,
+                                          fontSize: 14,
+                                          fontWeight: FontWeight.w500,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(height: 16),
+                                    ElevatedButton.icon(
+                                      onPressed: _initializeAppAndCheckStatus,
+                                      icon: const Icon(Icons.refresh_rounded, size: 18),
+                                      label: const Text('Retry'),
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: const Color(0xFF6C63FF),
+                                        foregroundColor: Colors.white,
+                                        shape: RoundedRectangleBorder(
+                                          borderRadius: BorderRadius.circular(12),
+                                        ),
+                                        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                                      ),
+                                    ),
+                                  ],
+                                )
+                              : Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    _buildDot(0, Colors.deepPurple),
+                                    const SizedBox(width: 10),
+                                    _buildDot(1, Colors.deepPurple.shade300),
+                                    const SizedBox(width: 10),
+                                    _buildDot(2, Colors.deepPurple.shade100),
+                                  ],
+                                ),
+                        );
+                      },
                     ),
                   ],
                 ),
               ),
               
-              // Shimmer progress loader at the bottom
+              // Version text at bottom
               Positioned(
-                bottom: 80,
+                bottom: 30,
                 left: 0,
                 right: 0,
                 child: Center(
-                  child: SizedBox(
-                    width: 180,
-                    child: Column(
-                      children: [
-                        ClipRRect(
-                          borderRadius: BorderRadius.circular(10),
-                          child: const LinearProgressIndicator(
-                            minHeight: 4,
-                            backgroundColor: Color(0xFFE2E8F0), // Light track
-                            valueColor: AlwaysStoppedAnimation<Color>(Color(0xFF6C63FF)),
-                          ),
-                        ),
-                        const SizedBox(height: 12),
-                        const Text(
-                          'Loading Experience...',
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: Color(0xFF94A3B8), // Mid slate grey
-                            fontWeight: FontWeight.w500,
-                          ),
-                        ),
-                      ],
+                  child: Text(
+                    'Version $_installedVersion',
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: Color(0xFF94A3B8),
+                      fontWeight: FontWeight.w400,
                     ),
                   ),
                 ),
@@ -234,77 +431,117 @@ class _SplashScreenState extends State<SplashScreen> with SingleTickerProviderSt
       ),
     );
   }
-}
 
-// Custom Painter for a stunning e-commerce cart + infinity logo
-class LogoPainter extends CustomPainter {
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 6.0
-      ..strokeCap = StrokeCap.round;
-
-    final rect = Rect.fromLTWH(0, 0, size.width, size.height);
-    
-    // Draw outer neon border
-    paint.shader = const LinearGradient(
-      colors: [Color(0xFF6C63FF), Color(0xFF00F2FE)],
-    ).createShader(rect);
-    
-    canvas.drawArc(
-      rect.deflate(10),
-      0,
-      6.28, // Complete circle
-      false,
-      paint,
-    );
-
-    // Inner stylized 'S' + Shop Bag icon
-    final innerPaint = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 5.0
-      ..strokeCap = StrokeCap.round;
-
-    innerPaint.shader = const LinearGradient(
-      colors: [Color(0xFF00F2FE), Color(0xFF6C63FF)],
-    ).createShader(rect);
-
-    // Drawing shopping bag contour inside
-    final path = Path();
-    // Top handle
-    path.addArc(
-      Rect.fromCenter(
-        center: Offset(size.width / 2, size.height / 2 - 10),
-        width: 30,
-        height: 25,
+  List<Widget> _buildBackgroundDecorations() {
+    return [
+      // Top right circle
+      Positioned(
+        top: -80,
+        right: -80,
+        child: Container(
+          width: 250,
+          height: 250,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            gradient: RadialGradient(
+              colors: [
+                const Color(0xFF6C63FF).withOpacity(0.05),
+                const Color(0xFF6C63FF).withOpacity(0.02),
+                Colors.transparent,
+              ],
+              stops: const [0.0, 0.5, 1.0],
+            ),
+          ),
+        ),
       ),
-      3.14,
-      3.14,
-    );
-    
-    // Bag body
-    path.moveTo(size.width / 2 - 22, size.height / 2 - 10);
-    path.lineTo(size.width / 2 + 22, size.height / 2 - 10);
-    path.lineTo(size.width / 2 + 18, size.height / 2 + 25);
-    path.quadraticBezierTo(
-      size.width / 2,
-      size.height / 2 + 30,
-      size.width / 2 - 18,
-      size.height / 2 + 25,
-    );
-    path.close();
-
-    canvas.drawPath(path, innerPaint);
-    
-    // Glowing dot in the center representing local store
-    final dotPaint = Paint()
-      ..color = const Color(0xFF00F2FE)
-      ..style = PaintingStyle.fill;
-    
-    canvas.drawCircle(Offset(size.width / 2, size.height / 2 + 5), 4, dotPaint);
+      
+      // Bottom left circle
+      Positioned(
+        bottom: -100,
+        left: -100,
+        child: Container(
+          width: 300,
+          height: 300,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            gradient: RadialGradient(
+              colors: [
+                const Color(0xFF8B83FF).withOpacity(0.05),
+                const Color(0xFF8B83FF).withOpacity(0.02),
+                Colors.transparent,
+              ],
+              stops: const [0.0, 0.5, 1.0],
+            ),
+          ),
+        ),
+      ),
+      
+      // Center-left small circle
+      Positioned(
+        left: -50,
+        top: MediaQuery.of(context).size.height * 0.4,
+        child: Container(
+          width: 150,
+          height: 150,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            gradient: RadialGradient(
+              colors: [
+                const Color(0xFFA59FFF).withOpacity(0.04),
+                Colors.transparent,
+              ],
+            ),
+          ),
+        ),
+      ),
+      
+      // Bottom-right small circle
+      Positioned(
+        right: -30,
+        bottom: MediaQuery.of(context).size.height * 0.3,
+        child: Container(
+          width: 120,
+          height: 120,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            gradient: RadialGradient(
+              colors: [
+                const Color(0xFF4F46E5).withOpacity(0.04),
+                Colors.transparent,
+              ],
+            ),
+          ),
+        ),
+      ),
+    ];
   }
 
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+  Widget _buildDot(int index, Color color) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, child) {
+        double value = _controller.value * 3 - index.toDouble();
+        double scale = (value.clamp(0.0, 1.0) * 0.5 + 0.5);
+        
+        return Transform.scale(
+          scale: scale,
+          child: Container(
+            width: 12,
+            height: 12,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: color,
+              boxShadow: [
+                BoxShadow(
+                  color: color.withOpacity(0.3),
+                  blurRadius: 8,
+                  spreadRadius: 2,
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
 }
